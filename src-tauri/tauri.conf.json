@@ -1,4 +1,4 @@
-{
+﻿{
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Raw Minute Counter",
   "version": "0.1.0",
@@ -35,3 +35,4 @@
     ]
   }
 }
+

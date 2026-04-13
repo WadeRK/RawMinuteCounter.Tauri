@@ -132,6 +132,12 @@ struct UpdateSheetResponse {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidateRootResponse {
+    reachable: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SearchRootConfig {
@@ -154,6 +160,27 @@ fn load_app_config() -> Result<AppConfig, String> {
 #[tauri::command]
 fn save_app_config(config: AppConfig) -> Result<(), String> {
     write_app_config(&config)
+}
+
+#[tauri::command]
+fn validate_root(path: String) -> Result<ValidateRootResponse, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(ValidateRootResponse { reachable: false });
+    }
+
+    if let Some(host) = extract_unc_hostname(trimmed) {
+        if !ping_host(host.as_str(), 1) {
+            return Ok(ValidateRootResponse { reachable: false });
+        }
+        return Ok(ValidateRootResponse {
+            reachable: Path::new(trimmed).exists(),
+        });
+    }
+
+    Ok(ValidateRootResponse {
+        reachable: Path::new(trimmed).exists(),
+    })
 }
 
 #[tauri::command]
@@ -632,6 +659,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_app_config,
             save_app_config,
+            validate_root,
             load_from_sheet,
             run_search,
             update_sheet

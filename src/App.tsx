@@ -78,6 +78,10 @@ type UpdateSheetBackendResponse = {
   message: string;
 };
 
+type ValidateRootBackendResponse = {
+  reachable: boolean;
+};
+
 type AppConfigRoot = {
   name: string;
   path: string;
@@ -328,18 +332,16 @@ function App() {
 
   useEffect(() => {
     if (screen !== "input") return;
-    rootPingTimersRef.current.forEach((timer) => window.clearTimeout(timer));
-    rootPingTimersRef.current = [];
-    const checking: Record<number, "checking"> = {};
-    activeRoots.forEach((root) => { checking[root.id] = "checking"; });
-    setRootReachability(checking);
-    activeRoots.forEach((root, index) => {
-      const timer = window.setTimeout(() => {
-        setRootReachability((prev) => ({ ...prev, [root.id]: root.id % 3 === 0 ? "bad" : "ok" }));
-      }, 450 + index * 240);
-      rootPingTimersRef.current.push(timer);
+    const status: Record<number, "checking" | "ok" | "bad"> = {};
+    rows.forEach((row) => {
+      const label = row.name.trim() || row.path.trim();
+      if (!label) return;
+      if (row.testState === "loading") status[row.id] = "checking";
+      else if (row.testState === "ok") status[row.id] = "ok";
+      else status[row.id] = "bad";
     });
-  }, [screen, activeRoots]);
+    setRootReachability(status);
+  }, [screen, rows]);
 
   useEffect(() => {
     if (screen !== "search") return;
@@ -426,15 +428,19 @@ function App() {
       if (validationTimersRef.current[id]) window.clearTimeout(validationTimersRef.current[id]);
       setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: value.trim() ? "loading" : "idle" } : row)));
       validationTimersRef.current[id] = window.setTimeout(() => {
-        setRows((prev) =>
-          prev.map((row) => {
-            if (row.id !== id) return row;
-            const path = row.path.trim();
-            if (!path) return { ...row, testState: "idle" };
-            const valid = /^([a-zA-Z]:\\|\\\\).+/.test(path);
-            return { ...row, testState: valid ? "ok" : "bad" };
-          }),
-        );
+        const path = rowsRef.current.find((row) => row.id === id)?.path.trim() ?? "";
+        if (!path) {
+          setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: "idle" } : row)));
+          delete validationTimersRef.current[id];
+          return;
+        }
+        void invoke<ValidateRootBackendResponse>("validate_root", { path })
+          .then((resp) => {
+            setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: resp.reachable ? "ok" : "bad" } : row)));
+          })
+          .catch(() => {
+            setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: "bad" } : row)));
+          });
         delete validationTimersRef.current[id];
       }, 1000);
     }
@@ -910,8 +916,8 @@ function App() {
 
   return (
     <div ref={windowRef} className="window" style={windowHeight !== null ? { height: `${windowHeight}px` } : undefined}>
-      <header ref={headerRef} className="header" data-tauri-drag-region>
-        <span className="h-title">{headerTitle}</span>
+      <header ref={headerRef} className="header">
+        <span className="h-title" data-tauri-drag-region>{headerTitle}</span>
         <div className="h-controls">
           {screen === "input" ? (
             <button type="button" className="h-btn" title="Config" onClick={() => navigateToScreen("config")}>
@@ -966,7 +972,7 @@ function App() {
                             <span className="material-symbols-outlined icon-18" aria-hidden="true">drag_indicator</span>
                           </button>
                           <input value={row.name} onChange={(event) => updateRow(row.id, "name", event.target.value)} onKeyDown={(event) => onRowKeyDown(event, row)} placeholder="e.g. Studio 1" className="cell-in name-in" />
-                          <input value={row.path} onChange={(event) => updateRow(row.id, "path", event.target.value)} onKeyDown={(event) => onRowKeyDown(event, row)} placeholder="\\S1Storage\\2026" className="cell-in" />
+                          <input value={row.path} onChange={(event) => updateRow(row.id, "path", event.target.value)} onKeyDown={(event) => onRowKeyDown(event, row)} placeholder="\\\\S1Storage\\2026" className="cell-in" />
                           <div className="action-cell">
                             <button type="button" className={`icon-btn test-btn${row.testState === "loading" ? " test-loading" : ""}${row.testState === "ok" ? " test-ok" : ""}${row.testState === "bad" ? " test-bad" : ""}`} title="Path validation status">
                               <span className={`material-symbols-outlined icon-16${row.testState === "loading" ? " spin" : ""}`} aria-hidden="true">{row.testState === "loading" ? "autorenew" : row.testState === "bad" ? "error" : "check_circle"}</span>

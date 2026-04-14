@@ -219,9 +219,8 @@ fn prepare_root_for_search(path: String) -> Result<PrepareRootResponse, String> 
             });
         }
 
-        let _ = hide_window(Command::new(WOL_EXE))
-            .args(["-w", "-m", host.as_str()])
-            .output();
+        let mut wol = Command::new(WOL_EXE);
+        let _ = hide_window(&mut wol).args(["-w", "-m", host.as_str()]).output();
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(120) {
             if ping_host(host.as_str(), 1) && Path::new(trimmed).exists() {
@@ -397,7 +396,8 @@ fn hide_window(cmd: &mut Command) -> &mut Command {
 }
 
 fn ping_host(host: &str, count: usize) -> bool {
-    hide_window(Command::new("ping"))
+    let mut ping = Command::new("ping");
+    hide_window(&mut ping)
         .args(["-n", &count.to_string(), "-w", "1000", host])
         .status()
         .map(|s| s.success())
@@ -417,7 +417,8 @@ fn shutdown_if_woke(root_path: &str) -> Result<(), String> {
     let Some(host) = extract_unc_hostname(root_path) else {
         return Ok(());
     };
-    hide_window(Command::new(WOL_EXE))
+    let mut wol = Command::new(WOL_EXE);
+    hide_window(&mut wol)
         .args(["-s", "-m", host.as_str(), "-t", "0", "-f"])
         .output()
         .map_err(|e| format!("Shutdown call failed: {e}"))?;
@@ -455,7 +456,8 @@ Get-ChildItem -LiteralPath $basePath -Recurse -File -Filter *MVI* | ForEach-Obje
 }
 Write-Output $total
 "#;
-    let output = hide_window(Command::new("powershell"))
+    let mut ps_cmd = Command::new("powershell");
+    let output = hide_window(&mut ps_cmd)
         .args([
             "-NoProfile",
             "-ExecutionPolicy",

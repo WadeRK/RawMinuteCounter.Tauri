@@ -82,6 +82,11 @@ type ValidateRootBackendResponse = {
   reachable: boolean;
 };
 
+type PrepareRootBackendResponse = {
+  reachable: boolean;
+  status: string;
+};
+
 type AppConfigRoot = {
   name: string;
   path: string;
@@ -180,6 +185,8 @@ function App() {
   const [updateSheetState, setUpdateSheetState] = useState<"idle" | "working" | "done">("idle");
   const [workerSearchState, setWorkerSearchState] = useState<Record<number, { state: WorkerSearchState; status: string }>>({});
   const [resultsRows, setResultsRows] = useState<ResultRow[]>([]);
+  const [searchRootsPayload, setSearchRootsPayload] = useState<Array<{ id: number; name: string; path: string }>>([]);
+  const [preSearchRootStatuses, setPreSearchRootStatuses] = useState<Record<number, { state: WorkerSearchState; status: string }>>({});
 
   const validationTimersRef = useRef<Record<number, number>>({});
   const sheetTimerARef = useRef<number | null>(null);
@@ -197,6 +204,7 @@ function App() {
   const configTabFxSettleTimerRef = useRef<number | null>(null);
   const searchTimersRef = useRef<number[]>([]);
   const searchElapsedTimerRef = useRef<number | null>(null);
+  const skipInputValidationOnceRef = useRef(false);
   const windowRef = useRef<HTMLDivElement | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
   const mainRef = useRef<HTMLElement | null>(null);
@@ -249,6 +257,9 @@ function App() {
         setTeacherRows(nextTeachers);
         setSavedSnapshot(snapshotRows(nextRoots));
         setSavedTeacherSnapshot(snapshotTeachers(nextTeachers));
+        const hasConfiguredRoots = nextRoots.some((row) => row.path.trim().length > 0);
+        const hasConfiguredTeachers = nextTeachers.some((row) => row.name.trim().length > 0);
+        setScreen(hasConfiguredRoots && hasConfiguredTeachers ? "input" : "config");
       })
       .catch(() => {
         const fallbackRoots = [{ id: 1, name: "", path: "" }];
@@ -338,21 +349,50 @@ function App() {
       if (!label) return;
       if (row.testState === "loading") status[row.id] = "checking";
       else if (row.testState === "ok") status[row.id] = "ok";
-      else status[row.id] = "bad";
+      else if (row.testState === "bad") status[row.id] = "bad";
+      else status[row.id] = "checking";
     });
     setRootReachability(status);
   }, [screen, rows]);
 
+  const validateRowPath = (id: number, explicitPath?: string) => {
+    const path = (explicitPath ?? rowsRef.current.find((row) => row.id === id)?.path ?? "").trim();
+    if (!path) {
+      setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: "idle" } : row)));
+      return Promise.resolve(false);
+    }
+    setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: "loading" } : row)));
+    return invoke<ValidateRootBackendResponse>("validate_root", { path })
+      .then((resp) => {
+        setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: resp.reachable ? "ok" : "bad" } : row)));
+        return resp.reachable;
+      })
+      .catch(() => {
+        setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: "bad" } : row)));
+        return false;
+      });
+  };
+
+  useEffect(() => {
+    if (screen !== "input") return;
+    if (skipInputValidationOnceRef.current) {
+      skipInputValidationOnceRef.current = false;
+      return;
+    }
+    const candidates = rowsRef.current.filter((row) => row.path.trim().length > 0);
+    candidates.forEach((row) => {
+      void validateRowPath(row.id, row.path);
+    });
+  }, [screen]);
+
   useEffect(() => {
     if (screen !== "search") return;
     let cancelled = false;
-    const rootsForSearch = rows
-      .map((row) => ({ id: row.id, name: row.name.trim() || row.path.trim(), path: row.path.trim() }))
-      .filter((row) => row.path.length > 0);
+    const rootsForSearch = searchRootsPayload;
     const foldersForSearch = sourceFolders;
 
-    const initial: Record<number, { state: WorkerSearchState; status: string }> = {};
-    activeRoots.forEach((root) => {
+    const initial: Record<number, { state: WorkerSearchState; status: string }> = { ...preSearchRootStatuses };
+    rootsForSearch.forEach((root) => {
       initial[root.id] = { state: "searching", status: "Searching..." };
     });
     setWorkerSearchState(initial);
@@ -369,6 +409,16 @@ function App() {
 
     const startedAt = Date.now();
 
+    if (rootsForSearch.length === 0) {
+      window.clearInterval(pctTimer);
+      setSearchElapsedSec(1);
+      setSearchPercent(100);
+      setSearchDone(true);
+      return () => {
+        cancelled = true;
+      };
+    }
+
     void invoke<RunSearchBackendResponse>("run_search", {
       request: {
         roots: rootsForSearch,
@@ -378,9 +428,9 @@ function App() {
       .then((resp) => {
         if (cancelled) return;
         window.clearInterval(pctTimer);
-        const next: Record<number, { state: WorkerSearchState; status: string }> = {};
+        const next: Record<number, { state: WorkerSearchState; status: string }> = { ...preSearchRootStatuses };
         activeRoots.forEach((root) => {
-          next[root.id] = { state: "unreachable", status: "Unreachable" };
+          if (!next[root.id]) next[root.id] = { state: "unreachable", status: "Unreachable" };
         });
         resp.rootStatuses.forEach((root) => {
           next[root.id] = {
@@ -412,7 +462,7 @@ function App() {
       cancelled = true;
       window.clearInterval(pctTimer);
     };
-  }, [screen, activeRoots, rows, sourceFolders]);
+  }, [screen, activeRoots, sourceFolders, searchRootsPayload, preSearchRootStatuses]);
 
   const focusRowNameInput = (id: number) => {
     window.setTimeout(() => {
@@ -434,13 +484,7 @@ function App() {
           delete validationTimersRef.current[id];
           return;
         }
-        void invoke<ValidateRootBackendResponse>("validate_root", { path })
-          .then((resp) => {
-            setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: resp.reachable ? "ok" : "bad" } : row)));
-          })
-          .catch(() => {
-            setRows((prev) => prev.map((row) => (row.id === id ? { ...row, testState: "bad" } : row)));
-          });
+        void validateRowPath(id, path);
         delete validationTimersRef.current[id];
       }, 1000);
     }
@@ -670,6 +714,7 @@ function App() {
       .then(() => {
         setSavedSnapshot(snapshotRows(rows));
         setSavedTeacherSnapshot(snapshotTeachers(teacherRows));
+        skipInputValidationOnceRef.current = true;
         navigateToScreen("input");
       })
       .catch((err) => {
@@ -771,12 +816,42 @@ function App() {
     setManualInput(next);
   };
 
-  const startSearch = () => {
+  const startSearch = async () => {
     if (!folderCount) {
       setSheetState("error");
       setSheetMessage("No folders loaded. Use Load from sheet first.");
       return;
     }
+
+    const candidateRoots = rows
+      .map((row) => ({ id: row.id, name: row.name.trim() || row.path.trim(), path: row.path.trim() }))
+      .filter((row) => row.path.length > 0);
+    if (!candidateRoots.length) {
+      window.alert("No search roots configured.");
+      return;
+    }
+
+    const preStatus: Record<number, { state: WorkerSearchState; status: string }> = {};
+    const reachableRoots: Array<{ id: number; name: string; path: string }> = [];
+    for (const root of candidateRoots) {
+      try {
+        const prep = await invoke<PrepareRootBackendResponse>("prepare_root_for_search", { path: root.path });
+        if (prep.reachable) {
+          reachableRoots.push(root);
+          preStatus[root.id] = { state: "searching", status: "Searching..." };
+          setRows((prev) => prev.map((row) => (row.id === root.id ? { ...row, testState: "ok" } : row)));
+        } else {
+          preStatus[root.id] = { state: "unreachable", status: prep.status || "Unreachable" };
+          setRows((prev) => prev.map((row) => (row.id === root.id ? { ...row, testState: "bad" } : row)));
+        }
+      } catch {
+        preStatus[root.id] = { state: "unreachable", status: "Unreachable" };
+        setRows((prev) => prev.map((row) => (row.id === root.id ? { ...row, testState: "bad" } : row)));
+      }
+    }
+
+    setSearchRootsPayload(reachableRoots);
+    setPreSearchRootStatuses(preStatus);
     setSheetState("success");
     setSheetMessage("Ready to start search.");
     navigateToScreen("search");
@@ -899,17 +974,22 @@ function App() {
   }, [screen, searchDone]);
 
   const onMinimize = async () => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
-    await getCurrentWindow().minimize();
+    try {
+      await getCurrentWindow().minimize();
+    } catch {}
   };
 
   const onClose = async () => {
-    if (!("__TAURI_INTERNALS__" in window)) { window.close(); return; }
+    const fallbackClose = () => window.close();
     if (isDirty) {
       const ok = window.confirm("You have unsaved changes. Close anyway?");
       if (!ok) return;
     }
-    await getCurrentWindow().close();
+    try {
+      await getCurrentWindow().close();
+    } catch {
+      fallbackClose();
+    }
   };
 
   const draggingRow = dragState ? rows.find((row) => row.id === dragState.id) ?? null : null;
@@ -974,7 +1054,7 @@ function App() {
                           <input value={row.name} onChange={(event) => updateRow(row.id, "name", event.target.value)} onKeyDown={(event) => onRowKeyDown(event, row)} placeholder="e.g. Studio 1" className="cell-in name-in" />
                           <input value={row.path} onChange={(event) => updateRow(row.id, "path", event.target.value)} onKeyDown={(event) => onRowKeyDown(event, row)} placeholder="\\\\S1Storage\\2026" className="cell-in" />
                           <div className="action-cell">
-                            <button type="button" className={`icon-btn test-btn${row.testState === "loading" ? " test-loading" : ""}${row.testState === "ok" ? " test-ok" : ""}${row.testState === "bad" ? " test-bad" : ""}`} title="Path validation status">
+                            <button type="button" className={`icon-btn test-btn${row.testState === "loading" ? " test-loading" : ""}${row.testState === "ok" ? " test-ok" : ""}${row.testState === "bad" ? " test-bad" : ""}`} title="Validate path" onClick={() => { void validateRowPath(row.id, row.path); }}>
                               <span className={`material-symbols-outlined icon-16${row.testState === "loading" ? " spin" : ""}`} aria-hidden="true">{row.testState === "loading" ? "autorenew" : row.testState === "bad" ? "error" : "check_circle"}</span>
                             </button>
                             <button type="button" className="icon-btn" onClick={() => duplicateRow(row.id)} title="Duplicate"><span className="material-symbols-outlined icon-16" aria-hidden="true">content_copy</span></button>

@@ -6,8 +6,12 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const SA_CLIENT_EMAIL: &str = "el-kheta-helper@long-advice-488916-j7.iam.gserviceaccount.com";
 const SA_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
@@ -138,6 +142,13 @@ struct ValidateRootResponse {
     reachable: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareRootResponse {
+    reachable: bool,
+    status: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SearchRootConfig {
@@ -180,6 +191,61 @@ fn validate_root(path: String) -> Result<ValidateRootResponse, String> {
 
     Ok(ValidateRootResponse {
         reachable: Path::new(trimmed).exists(),
+    })
+}
+
+#[tauri::command]
+fn prepare_root_for_search(path: String) -> Result<PrepareRootResponse, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(PrepareRootResponse {
+            reachable: false,
+            status: "Unreachable".to_string(),
+        });
+    }
+
+    if let Some(host) = extract_unc_hostname(trimmed) {
+        if ping_host(host.as_str(), 1) && Path::new(trimmed).exists() {
+            return Ok(PrepareRootResponse {
+                reachable: true,
+                status: "Ready".to_string(),
+            });
+        }
+
+        if !Path::new(WOL_EXE).exists() {
+            return Ok(PrepareRootResponse {
+                reachable: false,
+                status: "Unreachable".to_string(),
+            });
+        }
+
+        let _ = hide_window(Command::new(WOL_EXE))
+            .args(["-w", "-m", host.as_str()])
+            .output();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(120) {
+            if ping_host(host.as_str(), 1) && Path::new(trimmed).exists() {
+                return Ok(PrepareRootResponse {
+                    reachable: true,
+                    status: "Ready".to_string(),
+                });
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        return Ok(PrepareRootResponse {
+            reachable: false,
+            status: "Unreachable".to_string(),
+        });
+    }
+
+    Ok(PrepareRootResponse {
+        reachable: Path::new(trimmed).exists(),
+        status: if Path::new(trimmed).exists() {
+            "Ready".to_string()
+        } else {
+            "Unreachable".to_string()
+        },
     })
 }
 
@@ -280,17 +346,18 @@ fn run_search(request: RunSearchRequest) -> Result<RunSearchResponse, String> {
         .collect::<Vec<_>>();
 
     for root in &request.roots {
-        let (reachable, woke) = ensure_root_reachable(&root.path);
-        if !reachable {
-            root_statuses.push(RootStatusOut {
-                id: root.id,
-                state: "unreachable".to_string(),
-                status: "Unreachable".to_string(),
-            });
-            continue;
-        }
+        let root_map = match scan_root(&root.path, &row_index) {
+            Ok(m) => m,
+            Err(_) => {
+                root_statuses.push(RootStatusOut {
+                    id: root.id,
+                    state: "unreachable".to_string(),
+                    status: "Unreachable".to_string(),
+                });
+                continue;
+            }
+        };
 
-        let root_map = scan_root(&root.path, &row_index)?;
         for (name, (folder_hits, clip_hits, total_seconds)) in root_map {
             if let Some(indices) = row_index.get(&name) {
                 for idx in indices {
@@ -301,10 +368,6 @@ fn run_search(request: RunSearchRequest) -> Result<RunSearchResponse, String> {
                     }
                 }
             }
-        }
-
-        if woke {
-            let _ = shutdown_if_woke(&root.path);
         }
 
         root_statuses.push(RootStatusOut {
@@ -323,6 +386,117 @@ fn run_search(request: RunSearchRequest) -> Result<RunSearchResponse, String> {
         root_statuses,
         results,
     })
+}
+
+fn hide_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+fn ping_host(host: &str, count: usize) -> bool {
+    hide_window(Command::new("ping"))
+        .args(["-n", &count.to_string(), "-w", "1000", host])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn extract_unc_hostname(path: &str) -> Option<String> {
+    if !path.starts_with(r"\\") {
+        return None;
+    }
+    let stripped = path.trim_start_matches(r"\\");
+    stripped.split('\\').next().map(str::to_string)
+}
+
+#[allow(dead_code)]
+fn shutdown_if_woke(root_path: &str) -> Result<(), String> {
+    let Some(host) = extract_unc_hostname(root_path) else {
+        return Ok(());
+    };
+    hide_window(Command::new(WOL_EXE))
+        .args(["-s", "-m", host.as_str(), "-t", "0", "-f"])
+        .output()
+        .map_err(|e| format!("Shutdown call failed: {e}"))?;
+    Ok(())
+}
+
+fn count_mvi_files(base_path: &Path) -> usize {
+    walkdir::WalkDir::new(base_path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_file())
+        .filter(|e| e.file_name().to_string_lossy().to_uppercase().contains("MVI"))
+        .count()
+}
+
+fn sum_mvi_duration_seconds(base_path: &Path) -> i64 {
+    let ps = r#"
+$ErrorActionPreference='SilentlyContinue'
+$basePath = $args[0]
+$shell = New-Object -ComObject Shell.Application
+$total = 0
+Get-ChildItem -LiteralPath $basePath -Recurse -File -Filter *MVI* | ForEach-Object {
+  $ns = $shell.Namespace($_.DirectoryName)
+  if ($null -eq $ns) { return }
+  $item = $ns.ParseName($_.Name)
+  if ($null -eq $item) { return }
+  $dur = $ns.GetDetailsOf($item, 27)
+  if ([string]::IsNullOrWhiteSpace($dur)) { return }
+  $parts = $dur -split ':'
+  if ($parts.Length -eq 3) {
+    $total += [int]$parts[0] * 3600 + [int]$parts[1] * 60 + [int]$parts[2]
+  } elseif ($parts.Length -eq 2) {
+    $total += [int]$parts[0] * 60 + [int]$parts[1]
+  }
+}
+Write-Output $total
+"#;
+    let output = hide_window(Command::new("powershell"))
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps,
+            &base_path.to_string_lossy(),
+        ])
+        .output();
+
+    let Ok(out) = output else {
+        return 0;
+    };
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    text.parse::<i64>().unwrap_or(0)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            load_app_config,
+            save_app_config,
+            validate_root,
+            prepare_root_for_search,
+            load_from_sheet,
+            run_search,
+            update_sheet
+        ])
+        .setup(|app| {
+            if cfg!(debug_assertions) {
+                app.handle().plugin(
+                    tauri_plugin_log::Builder::default()
+                        .level(log::LevelFilter::Info)
+                        .build(),
+                )?;
+            }
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
 
 #[tauri::command]
@@ -507,62 +681,6 @@ fn configured_teachers() -> Result<HashSet<String>, String> {
     Ok(cfg.teachers.into_iter().collect())
 }
 
-fn ensure_root_reachable(root_path: &str) -> (bool, bool) {
-    let hostname = extract_unc_hostname(root_path);
-
-    if let Some(host) = hostname.as_deref() {
-        if ping_host(host, 2) && Path::new(root_path).exists() {
-            return (true, false);
-        }
-
-        if Path::new(WOL_EXE).exists() {
-            let _ = Command::new(WOL_EXE).args(["-w", "-m", host]).output();
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(120) {
-                if ping_host(host, 1) && Path::new(root_path).exists() {
-                    return (true, true);
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
-        return (false, false);
-    }
-
-    (Path::new(root_path).exists(), false)
-}
-
-fn shutdown_if_woke(root_path: &str) -> Result<(), String> {
-    let Some(host) = extract_unc_hostname(root_path) else {
-        return Ok(());
-    };
-    Command::new(WOL_EXE)
-        .args(["-s", "-m", host.as_str(), "-t", "0", "-f"])
-        .output()
-        .map_err(|e| format!("Shutdown call failed: {e}"))?;
-    Ok(())
-}
-
-fn extract_unc_hostname(path: &str) -> Option<String> {
-    if !path.starts_with(r"\\") {
-        return None;
-    }
-    let stripped = path.trim_start_matches(r"\\");
-    stripped.split('\\').next().map(str::to_string)
-}
-
-fn ping_host(host: &str, count: usize) -> bool {
-    Command::new("ping")
-        .args([
-            "-n",
-            &count.to_string(),
-            "-w",
-            "1000",
-            host,
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 fn scan_root(
     root_path: &str,
@@ -597,83 +715,4 @@ fn scan_root(
     }
 
     Ok(map)
-}
-
-fn count_mvi_files(base_path: &Path) -> usize {
-    walkdir::WalkDir::new(base_path)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().is_file())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .to_uppercase()
-                .contains("MVI")
-        })
-        .count()
-}
-
-fn sum_mvi_duration_seconds(base_path: &Path) -> i64 {
-    let ps = r#"
-$ErrorActionPreference='SilentlyContinue'
-$basePath = $args[0]
-$shell = New-Object -ComObject Shell.Application
-$total = 0
-Get-ChildItem -LiteralPath $basePath -Recurse -File -Filter *MVI* | ForEach-Object {
-  $ns = $shell.Namespace($_.DirectoryName)
-  if ($null -eq $ns) { return }
-  $item = $ns.ParseName($_.Name)
-  if ($null -eq $item) { return }
-  $dur = $ns.GetDetailsOf($item, 27)
-  if ([string]::IsNullOrWhiteSpace($dur)) { return }
-  $parts = $dur -split ':'
-  if ($parts.Length -eq 3) {
-    $total += [int]$parts[0] * 3600 + [int]$parts[1] * 60 + [int]$parts[2]
-  } elseif ($parts.Length -eq 2) {
-    $total += [int]$parts[0] * 60 + [int]$parts[1]
-  }
-}
-Write-Output $total
-"#;
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            ps,
-            &base_path.to_string_lossy(),
-        ])
-        .output();
-
-    let Ok(out) = output else {
-        return 0;
-    };
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    text.parse::<i64>().unwrap_or(0)
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            load_app_config,
-            save_app_config,
-            validate_root,
-            load_from_sheet,
-            run_search,
-            update_sheet
-        ])
-        .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
-            Ok(())
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
 }
